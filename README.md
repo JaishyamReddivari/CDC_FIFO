@@ -144,8 +144,8 @@ Top-level test class that builds the environment, raises an objection, starts th
 
 ```
 ┌─────────────┐     ┌────────────┐     ┌──────────┐     ┌──────────────┐
-│  Sequence    │────►│  Driver    │────►│   DUT    │────►│   Monitor    │
-│ (randomized) │     │ (stimuli)  │     │ (FIFO)   │     │ (passive)    │
+│  Sequence   │────►│  Driver    │────►│   DUT    │────►│   Monitor    │
+│ (randomized)│     │ (stimuli)  │     │ (FIFO)   │     │ (passive)    │
 └─────────────┘     └────────────┘     └──────────┘     └──────┬───────┘
                                                                │
                                                      analysis_port.write()
