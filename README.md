@@ -8,12 +8,12 @@ Clock Domain Crossing is one of the most error-prone areas in digital design. Th
 
 ### Key Features
 
-- **Dual-clock FIFO** — Independent write (`wclk` @ 100 MHz) and read (`rclk` @ ~71.4 MHz) domains with Gray code synchronizers
-- **16×8 Dual-Port RAM** — 16 entries, 8 bits wide
-- **Full UVM 1.2 environment** — Agent, driver, monitor, scoreboard, sequences, and test
-- **Constrained-random stimulus** — Weighted randomization with 70/30 write/read distribution
-- **Self-checking scoreboard** — Reference FIFO queue model with automatic data integrity checks
-- **Status flag coverage** — `full`, `empty`, `overrun`, and `underrun` detection and validation
+* **Dual-clock FIFO** — Independent write (`wclk` @ 100 MHz) and read (`rclk` @ ~71.4 MHz) domains with Gray code synchronizers
+* **16×8 Dual-Port RAM** — 16 entries, 8 bits wide
+* **Full UVM 1.2 environment** — Agent, driver, monitor, scoreboard, sequences, and test
+* **Constrained-random stimulus** — Weighted randomization with 70/30 write/read distribution
+* **Self-checking scoreboard** — Reference FIFO queue model with automatic data integrity checks and vacuous-pass detection
+* **Status flag coverage** — `full`, `empty`, `overrun`, and `underrun` detection and validation
 
 ## Design Under Test (DUT)
 
@@ -36,7 +36,7 @@ Clock Domain Crossing is one of the most error-prone areas in digital design. Th
 ### Design Parameters
 
 | Parameter | Value |
-|---|---|
+| --- | --- |
 | Data Width | 8 bits |
 | FIFO Depth | 16 entries |
 | Address Width | 4 bits (+1 MSB for full/empty) |
@@ -50,7 +50,7 @@ Binary pointers are converted to Gray code before crossing into the opposite dom
 ### Status Flags
 
 | Flag | Condition | Domain |
-|---|---|---|
+| --- | --- | --- |
 | `empty` | Gray read pointer == synchronized write pointer | `rclk` |
 | `full` | Gray write pointer == synchronized read pointer (top 2 MSBs inverted) | `wclk` |
 | `underrun` | Read attempted while FIFO is empty | `rclk` |
@@ -71,6 +71,8 @@ tb_top (SystemVerilog module)
                 │    ├── fifo_sequencer ─── fifo_sequence
                 │    ├── fifo_driver
                 │    └── fifo_monitor ──── analysis port
+                │         ├── monitor_write (wclk domain)
+                │         └── monitor_read  (rclk domain)
                 └── fifo_scoreboard ◄───── analysis export
 ```
 
@@ -81,7 +83,7 @@ tb_top (SystemVerilog module)
 The transaction class models a single FIFO operation. Fields are registered with the UVM field automation macros for built-in `print()`, `copy()`, `compare()`, and `pack()`/`unpack()` support.
 
 | Field | Type | Description |
-|---|---|---|
+| --- | --- | --- |
 | `write` | `rand bit` | Write enable |
 | `read` | `rand bit` | Read enable |
 | `data` | `rand bit [7:0]` | Write data / observed read data |
@@ -90,10 +92,12 @@ The transaction class models a single FIFO operation. Fields are registered with
 
 Generates **500 constrained-random transactions** with weighted distribution:
 
-```systemverilog
+```
 write dist {1:=70, 0:=30};   // 70% chance of write per txn
 read  dist {1:=70, 0:=30};   // 70% chance of read per txn
 ```
+
+Transactions follow the UVM sequencer protocol: `start_item()` → `randomize()` → `finish_item()`. This ensures the sequencer has granted the item before randomization occurs, which is UVM best practice.
 
 This distribution is tuned to stress the FIFO by keeping it moderately loaded, maximizing the probability of hitting `full`, `empty`, and simultaneous read/write scenarios under asynchronous clocking.
 
@@ -101,27 +105,41 @@ This distribution is tuned to stress the FIFO by keeping it moderately loaded, m
 
 Drives transactions onto the DUT interface with the following protocol:
 
-1. **Write path** — Asserts `wen` and `din` on the `wclk` posedge, skips if `full` is asserted
-2. **Read path** — Asserts `ren` on the `rclk` posedge, skips if `empty` is asserted
-3. Both operations are guarded by DUT status flags to respect backpressure
+1. **Write path** — Waits for `posedge wclk`, then checks `full`. If not full, asserts `wen` and `din` via NBA, waits one more `wclk` cycle, then deasserts `wen`.
+2. **Read path** — Waits for `posedge rclk`, then checks `empty`. If not empty, asserts `ren` via NBA, waits one more `rclk` cycle, then deasserts `ren`.
+3. **Idle path** — If neither write nor read is requested, the driver advances by one `wclk` cycle to prevent zero-delay simulation loops.
 
-The driver retrieves the virtual interface handle from `uvm_config_db` during the `build_phase`.
+Both operations are guarded by DUT status flags to respect backpressure. The driver retrieves the virtual interface handle from `uvm_config_db` during the `build_phase`.
 
 #### Monitor (`fifo_monitor`)
 
-Passively observes the DUT interface on every rising edge of either clock. For each sampled event it captures `dout`, `wen`, and `ren` into a transaction and broadcasts it via a `uvm_analysis_port` to all subscribers (scoreboard).
+Uses two **independent forked processes**, one per clock domain, to avoid CDC sampling races:
+
+* **`monitor_write()`** — Triggers on `posedge wclk`, waits `#1` to let the driver's NBA assignments resolve, then checks `wen && !full`. On a valid write, it captures `din` into a transaction with `write=1, read=0` and broadcasts it via the analysis port.
+* **`monitor_read()`** — Triggers on `posedge rclk`, waits `#1` for NBA resolution, then checks `ren && !empty`. On a valid read, it waits one additional `rclk` cycle for the registered RAM output (`rdata`) to become valid, then captures `dout` into a transaction with `write=0, read=1` and broadcasts it.
+
+The `#1` delay after each clock edge is critical: since the driver uses non-blocking assignments (`<=`), these values resolve in the NBA region *after* the active region where the monitor's `@(posedge)` trigger fires. Without the delay, the monitor would sample stale values and miss all transactions.
 
 #### Scoreboard (`fifo_scoreboard`)
 
-Implements a **reference model** using an internal SystemVerilog queue that mirrors expected FIFO behavior:
+Implements a **reference model** using an internal SystemVerilog queue (`bit [7:0] model_q[$]`) that mirrors expected FIFO behavior:
 
 ```
-On write → push data to reference queue
-On read  → pop front of reference queue, compare against DUT output
-Mismatch → uvm_error("SB", "DATA MISMATCH")
+On write txn → push din to reference queue
+On read txn  → pop front of reference queue, compare against captured dout
+Mismatch     → uvm_error("SB", "DATA MISMATCH")
 ```
 
-This provides a self-checking, pass/fail mechanism without manual waveform inspection.
+The scoreboard also tracks `num_writes`, `num_reads`, and `num_matches` counters. In the UVM `check_phase`, it prints a summary and raises `UVM_ERROR` if either counter is zero, catching **vacuous passes** where the test completes without any actual data integrity checks.
+
+```
+===== SCOREBOARD SUMMARY =====
+  Writes captured : 245
+  Reads captured  : 245
+  Matches         : 245
+  Queue remaining : 0
+==============================
+```
 
 #### Agent (`fifo_agent`)
 
@@ -143,23 +161,31 @@ Top-level test class that builds the environment, raises an objection, starts th
 ### Verification Flow
 
 ```
-┌─────────────┐     ┌────────────┐     ┌──────────┐     ┌──────────────┐
-│  Sequence   │────►│  Driver    │────►│   DUT    │────►│   Monitor    │
-│ (randomized)│     │ (stimuli)  │     │ (FIFO)   │     │ (passive)    │
-└─────────────┘     └────────────┘     └──────────┘     └──────┬───────┘
-                                                               │
-                                                     analysis_port.write()
-                                                               │
-                                                        ┌──────▼───────┐
-                                                        │  Scoreboard  │
-                                                        │ (ref model)  │
-                                                        └──────────────┘
+┌─────────────┐     ┌────────────┐     ┌──────────┐
+│  Sequence   │────►│  Driver    │────►│   DUT    │
+│ (randomized)│     │ (stimuli)  │     │ (FIFO)   │
+└─────────────┘     └────────────┘     └──────────┘
+                                            │
+                         ┌──────────────────┤
+                         ▼                  ▼
+                  ┌─────────────┐    ┌─────────────┐
+                  │  Monitor    │    │  Monitor    │
+                  │  (wclk)     │    │  (rclk)     │
+                  │ captures din│    │captures dout│
+                  └──────┬──────┘    └──────┬──────┘
+                         │                  │
+                         ▼                  ▼
+                  ┌────────────────────────────────┐
+                  │         Scoreboard             │
+                  │   (ref model + vacuous-pass    │
+                  │    detection in check_phase)   │
+                  └────────────────────────────────┘
 ```
 
 ### What the Testbench Validates
 
 | Scenario | How It's Covered |
-|---|---|
+| --- | --- |
 | Basic write → read data integrity | Scoreboard queue comparison on every read |
 | FIFO full condition | Constrained-random write-heavy traffic fills FIFO; driver respects `full` flag |
 | FIFO empty condition | Read-heavy bursts drain FIFO; driver respects `empty` flag |
@@ -167,14 +193,15 @@ Top-level test class that builds the environment, raises an objection, starts th
 | Underrun detection | Read attempted when empty → `underrun` flag asserted |
 | CDC metastability safety | Mismatched clock frequencies (100 MHz vs ~71.4 MHz) exercise async boundaries |
 | Simultaneous read/write | 70/30 distribution ensures high probability of concurrent operations |
+| Vacuous pass prevention | `check_phase` asserts that writes and reads were actually observed |
 
 ## File Structure
 
 ```
 cdc-fifo/
-├── dp_ram_top.v      # Dual-port RAM (16×8), independent R/W clocks
-├── top.v             # Async FIFO top — pointers, Gray code, synchronizers, flags
-├── tb_top.sv         # UVM testbench (interface, txn, seq, drv, mon, sb, agent, env, test)
+├── ram_top.sv       # Dual-port RAM (16×8), independent R/W clocks
+├── top.sv           # Async FIFO top — pointers, Gray code, synchronizers, flags
+├── tb.sv            # UVM testbench (interface, txn, seq, drv, mon, sb, agent, env, test)
 └── README.md
 ```
 
@@ -184,18 +211,18 @@ cdc-fifo/
 
 A Verilog/SystemVerilog simulator with **UVM 1.2** support:
 
-- Synopsys VCS
-- Cadence Xcelium
-- Mentor Questa / ModelSim
-- Icarus Verilog (with UVM plugin)
+* Synopsys VCS
+* Cadence Xcelium
+* Mentor Questa / ModelSim
+* Icarus Verilog (with UVM plugin)
 
 ### Running the Simulation
 
 **VCS:**
 
-```bash
+```
 vcs -full64 -sverilog -ntb_opts uvm-1.2 \
-    dp_ram_top.v top.v tb_top.sv \
+    ram_top.sv top.sv tb.sv \
     -o simv -timescale=1ns/1ps
 
 ./simv +UVM_TESTNAME=fifo_test +UVM_VERBOSITY=UVM_MEDIUM
@@ -203,27 +230,33 @@ vcs -full64 -sverilog -ntb_opts uvm-1.2 \
 
 **Questa:**
 
-```bash
-vlog -sv +incdir+$UVM_HOME/src dp_ram_top.v top.v tb_top.sv
+```
+vlog -sv +incdir+$UVM_HOME/src ram_top.sv top.sv tb.sv
 vsim -c tb_top +UVM_TESTNAME=fifo_test -do "run -all; quit"
 ```
 
 **Xcelium:**
 
-```bash
+```
 xrun -sv -uvm -uvmhome CDNS-1.2 \
-    dp_ram_top.v top.v tb_top.sv \
+    ram_top.sv top.sv tb.sv \
     -timescale 1ns/1ps +UVM_TESTNAME=fifo_test
 ```
 
 ### Expected Output
 
-A passing simulation will complete with no `UVM_ERROR` or `UVM_FATAL` messages:
+A passing simulation will complete with no `UVM_ERROR` or `UVM_FATAL` messages and a non-zero scoreboard summary:
 
 ```
 UVM_INFO  ... [RNTST] Running test fifo_test...
 ...
-UVM_INFO  ... [UVMTOP] UVM testbench topology:
+UVM_INFO  ... [SB]
+===== SCOREBOARD SUMMARY =====
+  Writes captured : 245
+  Reads captured  : 245
+  Matches         : 245
+  Queue remaining : 0
+==============================
 ...
 --- UVM Report Summary ---
 ** Report counts by severity
@@ -231,16 +264,14 @@ UVM_INFO    :    XX
 UVM_WARNING :    0
 UVM_ERROR   :    0
 UVM_FATAL   :    0
-** Report counts by id
-...
 ```
 
-Any `DATA MISMATCH` errors from the scoreboard indicate a functional failure in the DUT.
+Any `DATA MISMATCH` errors from the scoreboard indicate a functional failure in the DUT. A `VACUOUS PASS` error indicates the monitor failed to capture transactions — check interface connectivity and clock generation.
 
 ## Possible Extensions
 
-- **Functional coverage** — Add `covergroup` for pointer states, flag transitions, and FIFO occupancy bins
-- **Assertions (SVA)** — Protocol checks on Gray code properties, flag timing, and no data loss guarantees
-- **Multiple sequences** — Add targeted sequences for burst writes, burst reads, back-to-back fill/drain, and reset-mid-operation
-- **Parameterization** — Make data width, depth, and synchronizer stages configurable with verification across multiple configs
-- **Regression suite** — Multiple test classes with different seeds and stimulus profiles for broader coverage closure
+* **Functional coverage** — Add `covergroup` for pointer states, flag transitions, and FIFO occupancy bins
+* **Assertions (SVA)** — Protocol checks on Gray code properties, flag timing, and no data loss guarantees
+* **Multiple sequences** — Add targeted sequences for burst writes, burst reads, back-to-back fill/drain, and reset-mid-operation
+* **Parameterization** — Make data width, depth, and synchronizer stages configurable with verification across multiple configs
+* **Regression suite** — Multiple test classes with different seeds and stimulus profiles for broader coverage closure
